@@ -397,6 +397,17 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     return result.returncode == 0
 
 
+def _git_has_commit(repo_root: Path) -> bool:
+    """True when ``repo_root`` has at least one commit (HEAD resolves).
+
+    A fresh ``git init`` has an *unborn* HEAD: ``rev-parse HEAD`` fails because
+    no ref points at a commit yet. Passing ``HEAD`` as the start point of
+    ``git worktree add`` then dies with ``fatal: invalid reference: HEAD``,
+    which used to fail dispatch for any task anchored at an empty repo.
+    """
+    return _kb._git_out(repo_root, "rev-parse", "--verify", "--quiet", "HEAD") is not None
+
+
 def _git_abs_path(path: Path, flag: str) -> Optional[Path]:
     out = _kb._git_out(path, "rev-parse", "--path-format=absolute", flag)
     return Path(out).expanduser().resolve(strict=False) if out else None
@@ -447,8 +458,13 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
-    else:
+    elif _git_has_commit(repo_root):
         args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+    else:
+        # Unborn repo (no commits): there is no HEAD to branch from, and git
+        # rejects an explicit "HEAD" start point. Omitting it lets git create
+        # the worktree on a new unborn branch of its own.
+        args = ["worktree", "add", "-b", branch_name, str(target)]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
