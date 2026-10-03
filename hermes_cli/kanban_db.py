@@ -2412,6 +2412,40 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
     return run_id
 
 
+def _current_instantiation_epoch() -> str:
+    """``gateway.drain_control.current_instantiation_epoch`` — the same boot witness
+    ``_process_fingerprint`` (kanban_db_dispatch) composes into a worker fingerprint.
+
+    Imported lazily: ``hermes_cli`` must not depend on ``gateway`` at import time. ``""`` when the
+    epoch is unreadable (non-Linux, no ``/proc``), which disables every epoch comparison rather than
+    failing closed.
+    """
+    try:
+        from gateway.drain_control import current_instantiation_epoch
+    except ImportError:
+        return ""
+    return current_instantiation_epoch()
+
+
+def _worker_boot_epoch(fingerprint) -> str:
+    """Instantiation epoch of the boot a worker fingerprint was captured on, or ``""``.
+
+    ``_process_fingerprint`` (kanban_db_dispatch) persists ``"<epoch>|<start>"`` into
+    ``tasks.worker_started_at``; the epoch is ``gateway.drain_control.current_instantiation_epoch``
+    (boot_id + PID-1 start), which changes on every reboot / container recreate. A row that survived
+    a reboot therefore carries an epoch no live process can match — the worker is gone because the
+    host restarted, not because the card failed. Only a well-formed string of that exact shape yields
+    an epoch: a missing / integer (legacy pre-fingerprint) value, the ``unverified`` marker, or any
+    other malformed string yields ``""`` so the caller keeps the counted-failure behaviour.
+    """
+    if not isinstance(fingerprint, str):
+        return ""
+    epoch, sep, start = fingerprint.partition("|")
+    if not sep or not epoch or not start.replace(".", "", 1).isdigit():
+        return ""
+    return epoch
+
+
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
 ) -> int:
@@ -2422,6 +2456,9 @@ def release_stale_claims(
     without a worker ever spawning otherwise loops claim -> reclaim -> claim
     with ``consecutive_failures`` stuck at 0, so the breaker never trips.
     ``reclaim_task`` (operator path) deliberately resets the counter instead.
+    The one carve-out is a claim whose worker fingerprint carries an epoch from a
+    previous boot (see ``_worker_boot_epoch``): the worker died with the host, so
+    the reclaim is booked as ``infrastructure`` and the counter is left alone.
 
     A host-local worker that is still alive gets its claim *extended* instead
     (a slow model can sit longer than the TTL inside one tool-free call, so no
@@ -2444,6 +2481,7 @@ def release_stale_claims(
     now = int(time.time())
     reclaimed = 0
     host_prefix = _host_prefix()
+    current_epoch = _current_instantiation_epoch()
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
         "       assignee "
@@ -2504,11 +2542,23 @@ def release_stale_claims(
         # Own txn, after the reclaim commit (same shape as ``enforce_max_runtime``):
         # the run ended without a verdict, so it counts toward the breaker and a
         # trip flips the task to ``blocked`` + ``gave_up`` on top of ``reclaimed``.
+        # One exception: when the recorded worker fingerprint carries an epoch
+        # from a *previous* boot, the worker died with the host, not with the card
+        # — nothing about the card ran, so the reclaim and its outcome are still
+        # recorded but the charge is infrastructure (``_record_task_failure``
+        # leaves ``consecutive_failures`` alone and never trips), keeping the
+        # card retryable instead of blocking it after DEFAULT_FAILURE_LIMIT
+        # reclaims of a machine that restarted under it. A legacy/integer or
+        # malformed fingerprint has no epoch, and an unreadable current epoch
+        # (non-Linux, no /proc) disables the check — both keep the charge.
+        recorded_epoch = _worker_boot_epoch(started_at)
+        reboot_loss = bool(recorded_epoch) and bool(current_epoch) and recorded_epoch != current_epoch
         _record_task_failure(
             conn, row["id"], f"stale_lock={row['claim_lock']}",
             outcome="reclaimed", failure_limit=failure_limit,
             release_claim=False, end_run=False,
             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
+            infrastructure=reboot_loss,
         )
         # Post-commit observer; every non-reclaim branch ``continue``d above.
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):

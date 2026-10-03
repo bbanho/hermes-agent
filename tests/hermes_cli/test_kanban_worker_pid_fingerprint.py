@@ -216,11 +216,22 @@ def _dead_worker_row(conn, *, fingerprint, pid: int = DEAD_PID) -> str:
     return tid
 
 
-def _expire_again(conn, tid: str) -> None:
-    """Re-claim an expired card and expire it again (one more reclaim cycle)."""
+def _expire_again(conn, tid: str, fingerprint) -> None:
+    """Re-claim an expired card, re-arm the same worker fingerprint and expire it again (one more
+    reclaim cycle).
+
+    The fingerprint MUST be re-armed: the reclaim clears ``worker_pid`` / ``worker_started_at``, so a
+    re-claim without a spawn leaves them NULL and the next cycle exercises the no-worker path
+    (#111306, always counted) instead of the epoch comparison under test. Re-arming keeps each cycle
+    modelling the state the epoch discriminator is meant to judge. For the reboot case it means the
+    host restarted again under the card, which is the repeat it is there to prove.
+    """
     assert kb.claim_task(conn, tid) is not None
     with kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 3600, tid))
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_started_at = ?, claim_expires = ? WHERE id = ?",
+            (DEAD_PID, fingerprint, int(time.time()) - 3600, tid),
+        )
 
 
 def _state(conn, tid: str) -> tuple[int, str, Optional[str]]:
@@ -241,14 +252,15 @@ def test_reboot_stale_reclaim_does_not_charge_the_card(board, monkeypatch, boot_
     sig = lambda pid, s: signals.append((pid, s))  # noqa: E731
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
 
-    tid = _dead_worker_row(conn, fingerprint=_fingerprint("previousboot:9"))
+    stale_fingerprint = _fingerprint("previousboot:9")
+    tid = _dead_worker_row(conn, fingerprint=stale_fingerprint)
 
     # Two reclaim cycles: with the charge intact the second one trips the breaker
     # (DEFAULT_FAILURE_LIMIT == 2), which is exactly the reported symptom.
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert _state(conn, tid)[:2] == (0, "ready")
 
-    _expire_again(conn, tid)
+    _expire_again(conn, tid, stale_fingerprint)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     failures, status, last_error = _state(conn, tid)
     assert failures == 0
@@ -275,13 +287,13 @@ def test_same_boot_stale_reclaim_still_charges_and_blocks(board, monkeypatch, bo
     sig = lambda pid, s: None  # noqa: E731
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
 
-    live_epoch = boot_epoch["value"]
-    tid = _dead_worker_row(conn, fingerprint=_fingerprint(live_epoch))
+    live_fingerprint = _fingerprint(boot_epoch["value"])
+    tid = _dead_worker_row(conn, fingerprint=live_fingerprint)
 
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert _state(conn, tid)[:2] == (1, "ready")
 
-    _expire_again(conn, tid)
+    _expire_again(conn, tid, live_fingerprint)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert _state(conn, tid)[:2] == (kbd.DEFAULT_FAILURE_LIMIT, "blocked")
     kinds = [e.kind for e in kb.list_events(conn, tid)]
@@ -296,12 +308,13 @@ def test_legacy_integer_fingerprint_still_charges(board, monkeypatch, boot_epoch
     sig = lambda pid, s: None  # noqa: E731
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
 
-    tid = _dead_worker_row(conn, fingerprint=534886)
+    legacy = 534886
+    tid = _dead_worker_row(conn, fingerprint=legacy)
 
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert _state(conn, tid)[:2] == (1, "ready")
 
-    _expire_again(conn, tid)
+    _expire_again(conn, tid, legacy)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert _state(conn, tid)[:2] == (kbd.DEFAULT_FAILURE_LIMIT, "blocked")
 
@@ -314,11 +327,12 @@ def test_no_current_epoch_still_charges(board, monkeypatch, boot_epoch):
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
 
     boot_epoch["value"] = ""
-    tid = _dead_worker_row(conn, fingerprint=_fingerprint("previousboot:9"))
+    stale_fingerprint = _fingerprint("previousboot:9")
+    tid = _dead_worker_row(conn, fingerprint=stale_fingerprint)
 
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert _state(conn, tid)[:2] == (1, "ready")
 
-    _expire_again(conn, tid)
+    _expire_again(conn, tid, stale_fingerprint)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert _state(conn, tid)[:2] == (kbd.DEFAULT_FAILURE_LIMIT, "blocked")
