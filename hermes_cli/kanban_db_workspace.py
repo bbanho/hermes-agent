@@ -448,7 +448,13 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+        # No explicit start point: git resolves it to HEAD itself. Passing the
+        # literal "HEAD" looked equivalent but broke every task anchored at a
+        # repo with zero commits, where HEAD is unborn and the command died
+        # with "fatal: invalid reference: HEAD", failing dispatch. On a repo
+        # with commits git infers HEAD (verified identical to naming it), and
+        # on an unborn one it infers --orphan, which is what we want there.
+        args = ["worktree", "add", "-b", branch_name, str(target)]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
