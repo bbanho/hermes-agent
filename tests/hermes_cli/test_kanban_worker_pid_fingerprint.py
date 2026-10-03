@@ -8,6 +8,7 @@ must require the spawn-time start fingerprint to match, never bare PID existence
 import os
 import signal
 import time
+from typing import Optional
 
 import pytest
 
@@ -25,6 +26,33 @@ def board(tmp_path, monkeypatch):
         yield conn
     finally:
         conn.close()
+
+
+@pytest.fixture
+def boot_epoch(monkeypatch):
+    """Pin the instantiation epoch so no assertion depends on this host's real boot.
+
+    Patched on ``gateway.drain_control`` — the single source both the fingerprint
+    (``_process_fingerprint``) and the stale-reclaim classification read — and,
+    defensively, on ``kanban_db`` in case the helper binds the name at module
+    scope. Tests set ``state["value"]``; the lru_cache on the real witness is
+    cleared first so a later reader cannot pick up a boot captured by another
+    test.
+    """
+    from gateway import drain_control
+
+    drain_control.current_instantiation_epoch.cache_clear()
+    state = {"value": "liveboot:1"}
+
+    def _fake_epoch():
+        return state["value"]
+
+    monkeypatch.setattr(drain_control, "current_instantiation_epoch", _fake_epoch)
+    monkeypatch.setattr(kb, "current_instantiation_epoch", _fake_epoch, raising=False)
+    return state
+
+
+DEAD_PID = 12345  # never signalled: _pid_alive is stubbed dead in these tests
 
 
 def _claimed_running(conn, *, pid: int, started_at, max_runtime=None) -> str:
@@ -149,3 +177,148 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     assert kb.release_stale_claims(conn, signal_fn=sig) == 1
     assert killed == [] and kb.get_task(conn, tid2).status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Reboot vs crash: a claim that died with the host is not a card failure.
+#
+# After a reboot every in-flight claim is stale by definition — the workers are
+# gone because the machine restarted, not because the card failed. Charged as a
+# failure, DEFAULT_FAILURE_LIMIT reclaims (two) block a card whose text will
+# never heal on retry. ``tasks.worker_started_at`` carries the
+# ``"<instantiation epoch>|<start>"`` fingerprint from ``_set_worker_pid``, and
+# that epoch changes on every reboot, so the recorded value distinguishes a
+# reboot from a genuine crash without touching anything else.
+#
+# The reclaim itself is unchanged either way (lock cleared, events recorded);
+# only the counter charge is at stake. "gave_up-shaped recording" is asserted
+# where it is real: the counted path below still emits ``gave_up`` and blocks.
+# On the suppressed path the card must NOT block, so no ``gave_up`` may exist —
+# the non-success outcome is still booked (``last_failure_error``) and each
+# reclaim is still in the event log.
+# ---------------------------------------------------------------------------
+
+
+def _fingerprint(epoch: str, start: int = 534886) -> str:
+    """``_process_fingerprint``'s form for a worker spawned on ``epoch``."""
+    return f"{epoch}|{start}"
+
+
+def _dead_worker_row(conn, *, fingerprint, pid: int = DEAD_PID) -> str:
+    """Claimed + running, claim expired an hour ago, owned by a dead PID."""
+    tid = kb.create_task(conn, title="interrupted", assignee="worker")
+    kb.claim_task(conn, tid)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_started_at = ?, claim_expires = ? WHERE id = ?",
+            (pid, fingerprint, int(time.time()) - 3600, tid),
+        )
+    return tid
+
+
+def _expire_again(conn, tid: str) -> None:
+    """Re-claim an expired card and expire it again (one more reclaim cycle)."""
+    assert kb.claim_task(conn, tid) is not None
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 3600, tid))
+
+
+def _state(conn, tid: str) -> tuple[int, str, Optional[str]]:
+    """``(consecutive_failures, status, last_failure_error)`` of a card."""
+    row = conn.execute(
+        "SELECT consecutive_failures, status, last_failure_error FROM tasks WHERE id = ?", (tid,),
+    ).fetchone()
+    return int(row["consecutive_failures"]), row["status"], row["last_failure_error"]
+
+
+def test_reboot_stale_reclaim_does_not_charge_the_card(board, monkeypatch, boot_epoch):
+    """A reclaim of a previous boot's claim is infrastructure: the claim is still
+    reclaimed and the outcome still booked, but ``consecutive_failures`` does not
+    move — so DEFAULT_FAILURE_LIMIT reclaims can no longer block a card that the
+    host, not the card, killed."""
+    conn = board
+    signals: list[tuple[int, int]] = []
+    sig = lambda pid, s: signals.append((pid, s))  # noqa: E731
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+    tid = _dead_worker_row(conn, fingerprint=_fingerprint("previousboot:9"))
+
+    # Two reclaim cycles: with the charge intact the second one trips the breaker
+    # (DEFAULT_FAILURE_LIMIT == 2), which is exactly the reported symptom.
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 1
+    assert _state(conn, tid)[:2] == (0, "ready")
+
+    _expire_again(conn, tid)
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 1
+    failures, status, last_error = _state(conn, tid)
+    assert failures == 0
+    assert status == "ready"
+
+    kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert kinds.count("reclaimed") == 2
+    # Reclaim still clears the stale lock so a fresh worker can be spawned.
+    row = conn.execute(
+        "SELECT claim_lock, claim_expires, worker_pid FROM tasks WHERE id = ?", (tid,),
+    ).fetchone()
+    assert row["claim_lock"] is None and row["claim_expires"] is None and row["worker_pid"] is None
+    # The non-success outcome stays visible to operators even when uncharged.
+    assert "stale_lock=" in (last_error or "")
+    # Uncounted: no breaker event at all, so nothing holds the card for an operator.
+    assert "gave_up" not in kinds
+
+
+def test_same_boot_stale_reclaim_still_charges_and_blocks(board, monkeypatch, boot_epoch):
+    """Regression guard: with the epoch MATCHING the current boot the worker really
+    crashed. Accounting must be unchanged — the counter advances and the breaker
+    still trips at the limit, with ``gave_up`` recorded."""
+    conn = board
+    sig = lambda pid, s: None  # noqa: E731
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+    live_epoch = boot_epoch["value"]
+    tid = _dead_worker_row(conn, fingerprint=_fingerprint(live_epoch))
+
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 1
+    assert _state(conn, tid)[:2] == (1, "ready")
+
+    _expire_again(conn, tid)
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 1
+    assert _state(conn, tid)[:2] == (kbd.DEFAULT_FAILURE_LIMIT, "blocked")
+    kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert kinds.count("reclaimed") == 2
+    assert kinds[-1] == "gave_up"
+
+
+def test_legacy_integer_fingerprint_still_charges(board, monkeypatch, boot_epoch):
+    """Pre-fingerprint rows carry an integer ``worker_started_at``: there is no epoch
+    to compare, so the reclaim keeps counting (unchanged behaviour)."""
+    conn = board
+    sig = lambda pid, s: None  # noqa: E731
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+    tid = _dead_worker_row(conn, fingerprint=534886)
+
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 1
+    assert _state(conn, tid)[:2] == (1, "ready")
+
+    _expire_again(conn, tid)
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 1
+    assert _state(conn, tid)[:2] == (kbd.DEFAULT_FAILURE_LIMIT, "blocked")
+
+
+def test_no_current_epoch_still_charges(board, monkeypatch, boot_epoch):
+    """``current_instantiation_epoch()`` returns ``""`` off Linux / without ``/proc``:
+    the epoch check is disabled, not failed-closed. The reclaim stays counted."""
+    conn = board
+    sig = lambda pid, s: None  # noqa: E731
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+    boot_epoch["value"] = ""
+    tid = _dead_worker_row(conn, fingerprint=_fingerprint("previousboot:9"))
+
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 1
+    assert _state(conn, tid)[:2] == (1, "ready")
+
+    _expire_again(conn, tid)
+    assert kb.release_stale_claims(conn, signal_fn=sig) == 1
+    assert _state(conn, tid)[:2] == (kbd.DEFAULT_FAILURE_LIMIT, "blocked")
